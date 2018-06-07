@@ -1,0 +1,902 @@
+﻿<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Obj Render</title>
+    <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/dat-gui/0.6.5/dat.gui.min.js"></script>
+    <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/gl-matrix/2.4.0/gl-matrix.js"></script>
+    <script type="text/javascript" src="utilities.js"> </script>
+    <script type="text/javascript" src="simple-rotator.js"></script>
+    <script type="text/javascript">
+        "use strict";
+        function main() {
+            //Vertex Shader Program to unwrap the face texture for blurring
+            let unwrapVSS = `#version 300 es
+							precision mediump float;
+                            in vec4 a_position;
+                            in vec3 a_normal;
+		                    in vec2 a_texCoord;
+
+                            uniform vec3 u_light_direction;
+		                    uniform sampler2D u_image;
+							uniform mat4 u_lightview;
+							uniform mat4 u_lightprojection;
+
+                            out vec4 v_vertColor;
+							out vec3 v_lightCoord;
+							out vec4 v_ambientColor;
+							out vec3 v_normal;
+							out vec3 v_diffuseReflectance;
+							
+                            void main() {
+                                    //Perform lighting computations
+                                    vec3 diffuseReflectance = texture(u_image, a_texCoord).rgb;
+                                    float LdotN = clamp(dot(normalize(a_normal),normalize(u_light_direction)),0.0,1.0);
+                                    v_vertColor = vec4(diffuseReflectance*LdotN,1.0);
+									
+                                    //Convert to texture coordinates in the range [0, 1]
+                                    gl_Position = vec4((a_texCoord*2.0)-1.0, 0.0, 1.0);
+									
+									vec4 lightCoord = u_lightprojection*u_lightview*a_position;
+									v_lightCoord = lightCoord.xyz / lightCoord.w;
+									v_lightCoord = (v_lightCoord + 1.0) / 2.0;
+									v_normal = a_normal;
+									v_diffuseReflectance = diffuseReflectance;
+                            }`;
+            let unwrapFSS = `#version 300 es
+                            precision mediump float;
+                            in vec4 v_vertColor;
+							in vec3 v_lightCoord;
+							in vec4 v_ambientColor;
+							in vec3 v_normal;
+							in vec3 v_diffuseReflectance;
+							
+							uniform mat4 u_lightprojection;
+							uniform sampler2D u_depth_image;
+							uniform float u_use_translucent;
+							uniform vec3 u_light_direction;
+							
+                            out vec4 outColor;
+                            void main() {
+								//Transluscent lighting
+								vec3 lightTexCoord = v_lightCoord;
+                                vec4 depth = texture(u_depth_image, lightTexCoord.xy);
+								float LdotN = clamp(dot(normalize(v_normal),normalize(u_light_direction)), -1.0, 1.0);
+								vec4 transluscentLight = vec4(0.0, 0.0, 0.0, 0.0);
+								vec3 transluscentColor = vec3(0.75, 0.4, 0.25);
+								float distance = lightTexCoord.z - depth.x;
+								if(distance < 0.0) {
+									distance = -distance;
+								}
+								if (LdotN < 0.0) {
+									LdotN = -LdotN;
+									transluscentLight = LdotN*vec4(exp(-50.0*distance)*transluscentColor*v_diffuseReflectance, 1.0);
+									LdotN = 0.0;
+								}
+								
+								outColor = v_vertColor + u_use_translucent * transluscentLight;
+                            }`;
+
+            let sceneVSS = `#version 300 es
+                            precision mediump float;
+
+                            in vec4 a_position;
+                            in vec3 a_normal;
+		                    in vec2 a_texCoord;
+
+                            uniform mat4 u_modelview;
+		                    uniform mat4 u_projection;
+							uniform mat4 u_lightview;
+							uniform mat4 u_lightprojection;
+							uniform vec3 u_view_point;
+
+		                    out vec2 v_texCoord;
+							out vec3 v_lightCoord;
+							out vec3 v_normal;
+							out vec3 v_view_direction;
+
+                            void main() {
+								gl_Position = u_projection*u_modelview*a_position;
+								v_texCoord = a_texCoord;
+								vec4 lightTexCoord = u_lightprojection*u_lightview*a_position;
+								lightTexCoord = lightTexCoord / lightTexCoord.w;
+								v_lightCoord = lightTexCoord.xyz;
+								v_normal = a_normal;
+								v_view_direction = u_view_point - a_position.xyz;
+                            }`;
+            let sceneFSS = `#version 300 es
+                            precision mediump float;
+		
+                            in vec3 v_normal;
+		                    in vec2 v_texCoord;
+							in vec3 v_lightCoord;
+							in vec3 v_view_direction;
+
+		                    uniform sampler2D u_color_image;
+							uniform sampler2D u_depth_image;
+							uniform sampler2D u_specular_image;
+							uniform vec3 u_light_direction;
+							uniform float u_use_specular;
+							uniform float u_use_translucent;
+							uniform float u_texelSize;
+
+                            out vec4 outColor;
+ 
+                            void main() {
+								float visibility=1.0;
+									vec3 lightTexCoord = vec3(v_lightCoord.xyz+1.0)/2.0;
+									lightTexCoord.z -= 0.003; // I shift the depth value by an epsilon quantity.
+															   // This value may need adjustment.
+
+									if ( (lightTexCoord.x < 0.0) || (lightTexCoord.x > 1.0) || (lightTexCoord.y < 0.0) || (lightTexCoord.y > 1.0) || (lightTexCoord.z < 0.0) || (lightTexCoord.z > 1.0) ) {
+										visibility = 1.0; // outside shadow map bound.
+									}
+									else{
+									// Filter
+										int count = 0;
+										visibility = 0.;
+										for (int y = -1; y <= 1; ++y)
+										{
+											for (int x = -1; x <= 1; ++x)
+											{
+												vec2 offset = lightTexCoord.xy + vec2(float(x) * u_texelSize, float(y) * u_texelSize);
+												if ( (offset.x >= 0.0) && (offset.x <= 1.0) && (offset.y >= 0.0) && (offset.y <= 1.0) )
+												{
+													// read depth from shadowmap
+													float shadow = texture(u_depth_image, offset).x;
+													if ( lightTexCoord.z > shadow ) // Point under shadow.
+													{
+														visibility += 0.1; // Instead of solid black a dark gray will be more appropriate.
+													}
+													else
+													{
+														visibility += 1.0;
+														++count;
+													}
+												}
+											}
+										}
+									if ( count > 0 )
+										visibility /= float(count);
+									}
+
+								//Diffuse Lighting (these computations were performed in the unwrap program)
+							    vec3 diffuseReflectance = texture(u_color_image, v_texCoord).rgb;
+							
+
+								//Specular Lighting
+								float shininess = 1.0;
+								//shininess = texture(u_specular_image, v_texCoord).r;
+								vec3 halfVector = normalize(normalize(v_view_direction) + normalize(u_light_direction));
+								float NdotH = clamp(dot(normalize(v_normal),normalize(halfVector)), 0.0, 1.0);
+								float specular = pow(NdotH, 50.0) * pow(shininess, 600.0);
+								vec4 specularColor = vec4(0.15, 0.15, 0.15, 1.0);								
+
+                                outColor = vec4(visibility * diffuseReflectance, 1.0) + u_use_specular * specular * specularColor;
+								//outColor = transluscentLight + specular * specularColor;
+								
+								
+                            }`;
+							
+            let depthVSS = `#version 300 es
+                            precision mediump float;
+
+                            in vec4 a_position;
+							in vec3 a_normal;
+							in vec3 a_texCoord;
+							
+							uniform mat4 u_lightview;
+							uniform mat4 u_lightprojection;
+							
+							void main() {
+								gl_Position = u_lightprojection*u_lightview*a_position;
+                            }`;					
+            let depthFSS = `#version 300 es
+                            precision mediump float;
+							
+							out vec4 outColor;
+							
+							void main() {
+								outColor = vec4(gl_FragCoord.z, gl_FragCoord.z, gl_FragCoord.z, 1.0);
+                            }`;
+
+            let canvas = document.querySelector('canvas'); // document.getElementById('canvas');
+            let gl = canvas.getContext("webgl2"); 
+			gl.clearColor(0.0, 0.0, 0.0, 1.0);
+			gl.clearDepth(1.0);
+			gl.enable(gl.DEPTH_TEST);
+            gl.depthFunc(gl.LESS);
+
+			// Create Programs
+
+            //unwrapProgram is used to flatten a texture
+			let vertexShader = createShader(gl, gl.VERTEX_SHADER, unwrapVSS);
+			let fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, unwrapFSS);
+            let unwrapProgram = createProgram(gl, vertexShader, fragmentShader);
+			
+            vertexShader = createShader(gl, gl.VERTEX_SHADER, sceneVSS);
+            fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, sceneFSS);
+            //sceneProgram is used to render in 3D
+            let sceneProgram = createProgram(gl, vertexShader, fragmentShader);
+			
+			//depthProgram is used to calculate depths for shadows and transluscence
+			vertexShader = createShader(gl, gl.VERTEX_SHADER, depthVSS);
+            fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, depthFSS);
+            let depthProgram = createProgram(gl, vertexShader, fragmentShader);
+
+            let texture = load2DTexture(gl, "diffuse.jpg");
+			let specularTexture = load2DTexture(gl, "specular.jpg");
+
+
+            var renderScene = new RenderScene("emily_2_1.obj");
+            var renderQuad = new RenderQuad();
+			var simpleQuad = new SimpleQuad();
+            let guiHandle = create_gui();
+            var performBlur = true;
+			var viewPosition = [0, 0, 0];
+
+            var lightPosition = [0,0,0];
+			var reverseLightPosition = [0,0,0];
+			var lightDirection = sphericalToCartesian(45,90);
+			updateLightPosition(renderScene.lookAt, renderScene.dia, guiHandle.theta, guiHandle.phi);
+			
+
+            var viewMatrix, projectionMatrix, lightViewMatrix, lightProjectionMatrix, reverseLightViewMatrix;
+            viewMatrix = mat4.create();
+            lightViewMatrix = mat4.create();
+			reverseLightViewMatrix = mat4.create();
+
+
+			let rotator = new SimpleRotator( //new TrackballRotator(
+				canvas,
+				function(){
+                    viewMatrix = createViewMatrix(renderScene.lookAt, renderScene.dia);
+                    lightViewMatrix = createLightViewMatrix(renderScene.lookAt, renderScene.dia, lightPosition);
+					reverseLightViewMatrix = createLightViewMatrix(renderScene.lookAt, renderScene.dia, reverseLightPosition);
+                    draw();
+				}
+			);
+            viewMatrix = createViewMatrix(renderScene.lookAt, renderScene.dia);
+            lightViewMatrix = createLightViewMatrix(renderScene.lookAt, renderScene.dia, lightPosition);
+			reverseLightViewMatrix = createLightViewMatrix(renderScene.lookAt, renderScene.dia, reverseLightPosition);
+            projectionMatrix = createProjectionMatrix();
+			lightProjectionMatrix = createOrthoProjectionMatrix(renderScene.dia);
+			waitBeforeDraw();
+			function waitBeforeDraw(){
+                if (!texture.loadComplete) {
+                    requestAnimationFrame(waitBeforeDraw)
+                }
+                else {
+                    draw();
+                }
+			}
+
+			window.onresize=function(){
+                projectionMatrix = createProjectionMatrix();
+				lightProjectionMatrix = createOrthoProjectionMatrix(renderScene.dia);
+                draw();
+            }
+
+            //Changes light position and brightness
+			function updateLightVector(){
+				lightDirection = sphericalToCartesian(guiHandle.theta, guiHandle.phi);
+				updateLightPosition(renderScene.lookAt, renderScene.dia, guiHandle.theta, guiHandle.phi);
+            }
+			
+			//Changes light position and brightness
+            function updateLightPosition(lookAt, D, theta, phi) {
+                let W = new Float32Array([1,0,0]);
+                W = sphericalToCartesian(theta, phi);
+                lightPosition = [lookAt[0] + W[0] * (0.5 * D), lookAt[1] + W[1] * (0.5 * D), lookAt[2] + W[2] * (0.5 * D)];
+                reverseLightPosition = [lookAt[0] - W[0] * (0.5 * D), lookAt[1] - W[1] * (0.5 * D), lookAt[2] - W[2] * (0.5 * D)];
+                lightViewMatrix = createLightViewMatrix(renderScene.lookAt, renderScene.dia, lightPosition);
+				reverseLightViewMatrix = createLightViewMatrix(renderScene.lookAt, renderScene.dia, reverseLightPosition);
+            }
+
+			function create_gui(gl)
+            {
+                ///////////////////
+                //   GUI SETUP   //
+                ///////////////////
+                let gui = new dat.GUI({width:300});
+
+                let params = {
+                    theta: 45,
+                    phi: 90,
+                    blurOption:"blur",
+					specularOption:"specular",
+					translucentOption:"translucent"
+                };
+
+                gui.add(params,'theta')
+                    .min(0)
+                    .max(90)
+                    .step(1)
+                    .onChange(function(){
+                        updateLightVector();
+                        draw();
+                    }
+                    );
+                gui.add(params,'phi')
+                    .min(0)
+                    .max(360)
+                    .step(5)
+                    .onChange(function(){
+                        updateLightVector();
+                        draw();
+                    }
+                    );
+                gui.add(params,'blurOption',['blur','noBlur']).onChange(draw);
+				gui.add(params,'specularOption',['specular','noSpecular']).onChange(draw);
+				gui.add(params,'translucentOption',['translucent','noTranslucent']).onChange(draw);
+
+                return params;
+            }
+			
+			function createProjectionMatrix() {
+				resize(gl.canvas);
+				let projection=mat4.create();
+				mat4.perspective(projection, 45 * Math.PI / 180, gl.canvas.width / gl.canvas.height, 1, 150);
+				return projection;
+			}
+			function createViewMatrix(lookAt,D){
+				let M = rotator.getRotationMatrix();
+				let W = vec3.create();
+				vec3.transformMat3(W,[0,0,1],M);
+				let V = vec3.create();
+				vec3.transformMat3(V,[0,1,0],M);
+                let viewPoint = [lookAt[0] + W[0] * D, lookAt[1] + W[1] * D, lookAt[2] + W[2] * D];
+				viewPosition = viewPoint;
+                let modelView = mat4.create();
+                mat4.lookAt(modelView, viewPoint, lookAt, V);
+
+                return modelView;
+            }
+
+            //Creates a view matrix from the light's point of view
+            function createLightViewMatrix(lookAt, D, lightPos) {
+				let x = lightPos[0];
+				let y = lightPos[1];
+				let z = lightPos[2];
+				
+				let w = vec3.create();
+				w[0] = x - lookAt[0];
+				w[1] = y - lookAt[1];
+				w[2] = z - lookAt[2];
+				vec3.normalize(w,w);
+				let up = vec3.create();
+				up[0] = 0;
+				up[1] = -1;
+				up[2] = 0;
+				
+				if(guiHandle.theta == 0) {
+					up[0] = -1;
+					up[1] = 0;
+					up[2] = 0;
+				}
+				
+				let u = vec3.create();
+				let v = vec3.create();
+				vec3.normalize(u, vec3.cross(u, w, up));
+				vec3.normalize(v, vec3.cross(v, w, u));
+
+                let m = mat4.create();
+                m[0] = u[0]; m[4] = v[0]; m[8] = w[0]; m[12] = x;
+                m[1] = u[1]; m[5] = v[1]; m[9] = w[1]; m[13] = y;
+                m[2] = u[2]; m[6] = v[2]; m[10] = w[2]; m[14] = z;
+                m[3] = 0; m[7] = 0; m[11] = 0; m[15] = 1;
+
+                let mInv = mat4.create();
+                mat4.invert(mInv, m);
+
+                return mInv;
+				
+            }
+			
+			function createOrthoProjectionMatrix(bound) {
+				resize(gl.canvas);
+				let projection = mat4.create();
+				let left = -1.0*bound;
+				let right = -left;
+				let up = -left;
+				let down = left;
+				let near = 0.1*bound;
+				let far = 1.0*bound;
+				
+				mat4.ortho(projection, -bound, bound, -bound, bound, near, far);
+				return projection;
+			}
+			
+			 function sphericalToCartesian(theta,phi){ // Parameters: Theta, Phi is degrees.
+                    let sinTheta = Math.sin(theta/180*Math.PI);
+                    let cosTheta = Math.cos(theta/180*Math.PI);
+                    let sinPhi = Math.sin(phi/180*Math.PI);
+                    let cosPhi = Math.cos(phi/180*Math.PI);
+                    return [sinTheta*cosPhi,cosTheta,sinTheta*sinPhi];
+                }
+
+            const targetTextureWidth = canvas.width;
+            const targetTextureHeight = canvas.height;
+			
+            const blurFrameTex = createTextureForAttachment(targetTextureWidth, targetTextureHeight, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE);
+            const blurFrameTexD = createTextureForAttachment(targetTextureWidth, targetTextureHeight, gl.DEPTH_COMPONENT24, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, gl.NEAREST);
+
+            const tempFrameTex = createTextureForAttachment(targetTextureWidth, targetTextureHeight, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE);
+            const tempFrameTexD = createTextureForAttachment(targetTextureWidth, targetTextureHeight, gl.DEPTH_COMPONENT24, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, gl.NEAREST);
+			
+			const depthFrameTex = createTextureForAttachment(targetTextureWidth, targetTextureHeight, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE);
+            const depthFrameTexD = createTextureForAttachment(targetTextureWidth, targetTextureHeight, gl.DEPTH_COMPONENT24, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, gl.NEAREST);
+			
+			const targetColorTexture2 = createTextureForAttachment(targetTextureWidth, targetTextureHeight, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE);
+            const targetDepthTexture2 = createTextureForAttachment(targetTextureWidth, targetTextureHeight, gl.DEPTH_COMPONENT24, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, gl.NEAREST);
+
+            const blurFB = createFrameBufferWithAttachments([blurFrameTex, blurFrameTexD], [gl.COLOR_ATTACHMENT0, gl.DEPTH_ATTACHMENT]);
+            const tempFB = createFrameBufferWithAttachments([tempFrameTex, tempFrameTexD], [gl.COLOR_ATTACHMENT0, gl.DEPTH_ATTACHMENT]);
+			const depthFB = createFrameBufferWithAttachments([depthFrameTex, depthFrameTexD], [gl.COLOR_ATTACHMENT0, gl.DEPTH_ATTACHMENT]);
+			const fb2 = createFrameBufferWithAttachments([targetColorTexture2, targetDepthTexture2], [gl.COLOR_ATTACHMENT0, gl.DEPTH_ATTACHMENT]);
+			
+            const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+            if (status != gl.FRAMEBUFFER_COMPLETE) {
+                alert("Frame Buffer Attachment is incomplete");
+            }
+            else console.log("Attachment complete");
+            draw();
+
+            function createTextureForAttachment(width, height, internalFormat, format, type, filterType) {
+                let tex = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_2D, tex);
+                // define size and format of level 0
+                const level = 0;
+                const border = 0;
+                const data = null;
+                gl.texImage2D(gl.TEXTURE_2D, level, internalFormat,
+                    width, height, border, format, type, data);
+                // set the filtering so we don't need mips
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, (filterType) ? filterType : gl.LINEAR);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, (filterType) ? filterType : gl.LINEAR);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                return tex;
+            }
+            function createFrameBufferWithAttachments(texs, attachmentPoints) {
+                // Create and bind the framebuffer
+                const fbo = gl.createFramebuffer();
+                gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+                // attach the texture as the first color attachment
+                for (let i = 0; i < texs.length; i++) {
+                    gl.framebufferTexture2D(gl.FRAMEBUFFER, attachmentPoints[i], gl.TEXTURE_2D, texs[i], 0);
+                }
+                gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                return fbo;
+            }
+
+            function RenderScene(objFile) {
+
+                let modelGeom = readOBJ(objFile);
+                console.log(objFile);
+
+				let nVertexElements = (modelGeom.indices)?modelGeom.indices.length:modelGeom.vertexPositions.length/3;
+				this.lookAt = modelGeom.bounds.center;
+                this.dia = modelGeom.bounds.diagonal;
+
+                let wrapVao = null;
+                if (modelGeom.vertexNormals, modelGeom.vertexTextureCoords)
+                    wrapVao = createVao(
+                        gl, unwrapProgram,
+                        ["a_position", "a_normal", "a_texCoord"], [3, 3, 2],
+                        [modelGeom.vertexPositions, modelGeom.vertexNormals, modelGeom.vertexTextureCoords],
+                        modelGeom.indices
+                    );
+                else if (modelGeom.vertexNormals)
+                    wrapVao = createVao(
+                        gl, unwrapProgram,
+                        ["a_position", "a_normal"], [3, 3],
+                        [modelGeom.vertexPositions, modelGeom.vertexNormals],
+                        modelGeom.indices
+                    );
+                else if (modelGeom.vertexTextureCoords)
+                    wrapVao = createVao(
+                        gl, unwrapProgram,
+                        ["a_position", "a_texCoord"], [3, 2],
+                        [modelGeom.vertexPositions, modelGeom.vertexTextureCoords],
+                        modelGeom.indices
+                    );
+                else
+                    wrapVao = createVao(
+                        gl, unwrapProgram,
+                        ["a_position"], [3, 3], [modelGeom.vertexPositions],
+                        modelGeom.indices
+                    );
+
+
+                let objVao = null;
+                if (modelGeom.vertexNormals, modelGeom.vertexTextureCoords)
+                    objVao = createVao(
+                        gl, sceneProgram,
+                        ["a_position", "a_normal", "a_texCoord"], [3, 3, 2],
+                        [modelGeom.vertexPositions, modelGeom.vertexNormals, modelGeom.vertexTextureCoords],
+                        modelGeom.indices
+                    );
+                else if (modelGeom.vertexNormals)
+                    objVao = createVao(
+                        gl, sceneProgram,
+                        ["a_position", "a_normal"], [3, 3],
+                        [modelGeom.vertexPositions, modelGeom.vertexNormals],
+                        modelGeom.indices
+                    );
+                else if (modelGeom.vertexTextureCoords)
+                    objVao = createVao(
+                        gl, sceneProgram,
+                        ["a_position", "a_texCoord"], [3, 2],
+                        [modelGeom.vertexPositions, modelGeom.vertexTextureCoords],
+                        modelGeom.indices
+                    );
+                else
+                    objVao = createVao(
+                        gl, sceneProgram,
+                        ["a_position"], [3, 3], [modelGeom.vertexPositions],
+                        modelGeom.indices
+                    );
+					
+					
+				let depthVao = null;
+                if (modelGeom.vertexNormals, modelGeom.vertexTextureCoords)
+                    depthVao = createVao(
+                        gl, depthProgram,
+                        ["a_position", "a_normal", "a_texCoord"], [3, 3, 2],
+                        [modelGeom.vertexPositions, modelGeom.vertexNormals, modelGeom.vertexTextureCoords],
+                        modelGeom.indices
+                    );
+                else if (modelGeom.vertexNormals)
+                    depthVao = createVao(
+                        gl, depthProgram,
+                        ["a_position", "a_normal"], [3, 3],
+                        [modelGeom.vertexPositions, modelGeom.vertexNormals],
+                        modelGeom.indices
+                    );
+                else if (modelGeom.vertexTextureCoords)
+                    depthVao = createVao(
+                        gl, depthProgram,
+                        ["a_position", "a_texCoord"], [3, 2],
+                        [modelGeom.vertexPositions, modelGeom.vertexTextureCoords],
+                        modelGeom.indices
+                    );
+                else
+                    depthVao = createVao(
+                        gl, depthProgram,
+                        ["a_position"], [3, 3], [modelGeom.vertexPositions],
+                        modelGeom.indices
+                    );
+
+				this.drawUnwrap=function(lightView, lightProjection, colorTexture, depthTexture, useTranslucent) // ACTION
+				{
+					// Clear the canvas
+					gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+					gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+					// Set the program to use
+					gl.useProgram(unwrapProgram);
+
+					gl.uniform3fv(gl.getUniformLocation(unwrapProgram, "u_light_direction"), lightDirection);
+					gl.uniformMatrix4fv(gl.getUniformLocation(unwrapProgram, "u_lightview"), false, lightView);
+					gl.uniformMatrix4fv(gl.getUniformLocation(unwrapProgram, "u_lightprojection"), false, lightProjection);
+					gl.uniform1f(gl.getUniformLocation(unwrapProgram, "u_use_translucent"), useTranslucent);
+                    gl.uniform1i(gl.getUniformLocation(unwrapProgram, "u_image"), 0);
+					gl.uniform1i(gl.getUniformLocation(unwrapProgram, "u_depth_image"), 1);
+					
+                    gl.activeTexture(gl.TEXTURE0);
+                    gl.bindTexture(gl.TEXTURE_2D, colorTexture);
+					gl.activeTexture(gl.TEXTURE1);
+					gl.bindTexture(gl.TEXTURE_2D, depthTexture);
+
+					if (!modelGeom.vertexNormals){
+                        gl.vertexAttrib3f(gl.getAttribLocation(unwrapProgram, "a_normal"),0,1,0);
+					}
+					if (!modelGeom.vertexTextureCoords){
+                        gl.vertexAttrib2f(gl.getAttribLocation(unwrapProgram, "a_texCoord"),0.5,0.5);
+					}
+                    gl.bindVertexArray(wrapVao);
+
+					if (modelGeom.indices)
+						gl.drawElements(gl.TRIANGLES, nVertexElements, gl.UNSIGNED_SHORT, 0);
+                    else gl.drawArrays(gl.TRIANGLES, 0, nVertexElements);
+                }
+                this.draw = function (modelview, projection, lightView, lightProjection, colorTex, depthTex, specularTex, useSpecular) // ACTION
+                {
+                    // Clear the canvas
+                    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+                    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+                    // Set the program to use
+                    gl.useProgram(sceneProgram);
+
+                    gl.uniformMatrix4fv(gl.getUniformLocation(sceneProgram, "u_modelview"), false, modelview);
+                    gl.uniformMatrix4fv(gl.getUniformLocation(sceneProgram, "u_projection"), false, projection);
+					gl.uniformMatrix4fv(gl.getUniformLocation(sceneProgram, "u_lightview"), false, lightView);
+                    gl.uniformMatrix4fv(gl.getUniformLocation(sceneProgram, "u_lightprojection"), false, lightProjection);
+					gl.uniform3fv(gl.getUniformLocation(sceneProgram, "u_light_direction"), lightDirection);
+					gl.uniform3fv(gl.getUniformLocation(sceneProgram, "u_view_point"), viewPosition);
+					gl.uniform1i(gl.getUniformLocation(sceneProgram, "u_color_image"), 0);
+                    gl.uniform1i(gl.getUniformLocation(sceneProgram, "u_depth_image"), 1);
+                    gl.uniform1i(gl.getUniformLocation(sceneProgram, "u_specular_image"), 2);
+					gl.uniform1f(gl.getUniformLocation(sceneProgram, "u_use_specular"), useSpecular);
+					gl.uniform1f(gl.getUniformLocation(sceneProgram, "u_texelSize"), (1.0 / (targetTextureWidth * targetTextureHeight)));
+                    gl.activeTexture(gl.TEXTURE0);
+                    gl.bindTexture(gl.TEXTURE_2D, colorTex);
+					gl.activeTexture(gl.TEXTURE1);
+					gl.bindTexture(gl.TEXTURE_2D, depthTex);
+					gl.activeTexture(gl.TEXTURE2);
+					gl.bindTexture(gl.TEXTURE_2D, specularTex);
+					
+                    if (!modelGeom.vertexNormals) {
+                        gl.vertexAttrib3f(gl.getAttribLocation(sceneProgram, "a_normal"), 0, 1, 0);
+                    }
+                    if (!modelGeom.vertexTextureCoords) {
+                        gl.vertexAttrib2f(gl.getAttribLocation(sceneProgram, "a_texCoord"), 0.5, 0.5);
+                    }
+                    gl.bindVertexArray(objVao);
+
+                    if (modelGeom.indices)
+                        gl.drawElements(gl.TRIANGLES, nVertexElements, gl.UNSIGNED_SHORT, 0);
+                    else gl.drawArrays(gl.TRIANGLES, 0, nVertexElements);
+                }
+				
+				this.drawDepth = function (lightView, lightProjection) // ACTION
+                {
+                    // Clear the canvas
+                    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+                    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+                    // Set the program to use
+                    gl.useProgram(depthProgram);
+                    gl.uniformMatrix4fv(gl.getUniformLocation(depthProgram, "u_lightview"), false, lightView);
+					gl.uniformMatrix4fv(gl.getUniformLocation(depthProgram, "u_lightprojection"), false, lightProjection);
+                    if (!modelGeom.vertexNormals) {
+                        gl.vertexAttrib3f(gl.getAttribLocation(depthProgram, "a_normal"), 0, 1, 0);
+                    }
+                    if (!modelGeom.vertexTextureCoords) {
+                        gl.vertexAttrib2f(gl.getAttribLocation(depthProgram, "a_texCoord"), 0.5, 0.5);
+                    }
+                    gl.bindVertexArray(depthVao);
+
+                    if (modelGeom.indices)
+                        gl.drawElements(gl.TRIANGLES, nVertexElements, gl.UNSIGNED_SHORT, 0);
+                    else gl.drawArrays(gl.TRIANGLES, 0, nVertexElements);
+                }
+            }
+
+            //Renders a screen-oriented, textured quad
+            function RenderQuad() {
+                let vs = `#version 300 es
+                    in vec4 a_position;
+                    in vec2 a_texCoord;
+                    out vec2 v_texCoord;
+
+                    void main() {
+
+
+                      gl_Position = a_position;
+
+                      v_texCoord = a_texCoord;
+                }`;
+
+                let fs = `#version 300 es
+
+                    precision mediump float;
+
+                    uniform sampler2D u_image;
+                    in vec2 v_texCoord;
+                    out vec4 outColor;
+
+                    void main() {
+                      outColor = vec4(texture(u_image, v_texCoord).xyz,1.0);
+                }`;
+
+                fs = `#version 300 es
+                            precision mediump float;
+                            uniform sampler2D u_image;
+                            uniform float u_blurr_pass;
+
+                            in vec2 v_texCoord;
+                            out vec4 outColor;
+ 
+                            void main() {
+                              vec2 onePixel = vec2(1) / vec2(textureSize(u_image, 0));
+                              vec2 twoPixel = 2.0 * onePixel;
+                              vec2 threePixel = 3.0 * onePixel;
+
+                              vec4 weight3 = vec4(0.006, 0.0, 0.0, 1.0);
+                              vec4 weight2 = vec4(0.061, 0.0,  0.0,  1.0);
+                              vec4 weight1 = vec4(0.242, 0.25, 0.25, 1.0);
+                              vec4 weight0 = vec4(0.382, 0.5,  0.5,  1.0);
+ 
+                              if(u_blurr_pass == 0.0) {
+                                  outColor  = texture(u_image, v_texCoord + vec2(-threePixel.x, 0.0)) * weight3;
+                                  outColor += texture(u_image, v_texCoord + vec2(-twoPixel.x,   0.0)) * weight2;
+                                  outColor += texture(u_image, v_texCoord + vec2(-onePixel.x,   0.0)) * weight1;
+                                  outColor += texture(u_image, v_texCoord)                            * weight0;
+                                  outColor += texture(u_image, v_texCoord + vec2(onePixel.x,    0.0)) * weight1;
+                                  outColor += texture(u_image, v_texCoord + vec2(twoPixel.x,    0.0)) * weight2;
+                                  outColor += texture(u_image, v_texCoord + vec2(threePixel.x,  0.0)) * weight3;
+                              }
+                              else if (u_blurr_pass == 1.0){
+                                  outColor  = texture(u_image, v_texCoord + vec2(0.0, -threePixel.x)) * weight3;
+                                  outColor += texture(u_image, v_texCoord + vec2(0.0,   -twoPixel.x)) * weight2;
+                                  outColor += texture(u_image, v_texCoord + vec2(0.0,   -onePixel.x)) * weight1;
+                                  outColor += texture(u_image, v_texCoord)                            * weight0;
+                                  outColor += texture(u_image, v_texCoord + vec2(0.0,   onePixel.x))  * weight1;
+                                  outColor += texture(u_image, v_texCoord + vec2(0.0,   twoPixel.x))  * weight2;
+                                  outColor += texture(u_image, v_texCoord + vec2(0.0, threePixel.x))  * weight3;
+                              }
+                              else {
+                                  outColor = texture(u_image, v_texCoord);
+                              }
+                            }`;
+
+                let positions = [
+                    -1.0, -1.0,
+                    1.0, -1.0,
+                    -1.0, 1.0,
+                    1.0, 1.0
+                ];
+                let indices = [
+                    0, 1, 2, 2, 1, 3
+                ];
+                let nVertexElements = 6;
+                let texCoords = [
+                    0.0, 0.0,
+                    1.0, 0.0,
+                    0.0, 1.0,
+                    1.0, 1.0
+                ];
+
+                // Create Program
+                let vertexShader = createShader(gl, gl.VERTEX_SHADER, vs);
+                let fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fs);
+                let program = createProgram(gl, vertexShader, fragmentShader);
+
+                let vao = createVao(
+                    gl, program,
+                    ["a_position", "a_texCoord"], [2, 2], [positions, texCoords],
+                    indices
+                );
+                this.draw = function (tex, blurPass) {
+                    gl.useProgram(program);
+                    gl.uniform1i(gl.getUniformLocation(program, "u_image"), 0);
+                    gl.activeTexture(gl.TEXTURE0);
+                    gl.bindTexture(gl.TEXTURE_2D, tex);
+                    gl.uniform1f(gl.getUniformLocation(program, "u_blurr_pass"), blurPass);
+                    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+                    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+                    gl.bindVertexArray(vao);
+                    gl.drawElements(gl.TRIANGLES, nVertexElements, gl.UNSIGNED_SHORT, 0);
+
+                }
+            }
+			
+			function SimpleQuad(){
+                let vs = `#version 300 es
+                    in vec4 a_position;
+                    in vec2 a_texCoord;
+                    out vec2 v_texCoord;
+                    //uniform float u_aspect;
+                    void main() {
+
+                      // gl_Position is a special variable a vertex shader
+                      // is responsible for setting
+                      gl_Position = a_position;
+                       // pass the texCoord to the fragment shader
+                       // The GPU will interpolate this value between points
+                      v_texCoord = a_texCoord;
+                }`;
+
+                let fs = `#version 300 es
+
+                    precision mediump float;
+
+                    uniform sampler2D u_image;
+
+                    // the texCoords passed in from the vertex shader.
+                    in vec2 v_texCoord;
+
+                    // we need to declare an output for the fragment shader
+                    out vec4 outColor;
+
+                    void main() {
+                      // Just set the output to a constant redish-purple
+                      outColor = vec4(texture(u_image, v_texCoord).xxx,1.0);
+                }`;
+
+                let positions = [
+                    -1.0, -1.0,
+                     1.0, -1.0,
+                    -1.0,  1.0,
+                     1.0,  1.0
+                ];
+                let indices = [
+                    0, 1, 2, 2, 1, 3
+                ];
+                let nVertexElements = 6;
+                let texCoords = [
+                    0.0,  0.0,
+                    1.0,  0.0,
+                    0.0,  1.0,
+                    1.0,  1.0
+                ];
+
+                // Create Program
+                let vertexShader = createShader(gl, gl.VERTEX_SHADER, vs);
+                let fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fs);
+                let program = createProgram(gl, vertexShader, fragmentShader);
+
+                let vao = createVao(
+                    gl, program,
+                    ["a_position", "a_texCoord"], [2,2],[positions,texCoords],
+                    indices
+                );
+                this.draw=function(tex) {
+                    // Set the program to use
+                    gl.useProgram(program);
+                    gl.uniform1i(gl.getUniformLocation(program, "u_image"), 0);
+                    //gl.uniform1f(gl.getUniformLocation(program, "u_aspect"), gl.canvas.width / gl.canvas.height)
+
+                    gl.activeTexture(gl.TEXTURE0);
+                    // render the cube with the texture we just rendered to
+                    gl.bindTexture(gl.TEXTURE_2D, tex);
+
+                    // Tell WebGL how to convert from clip space to pixels
+                    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+
+                    // Clear the canvas AND the depth buffer.
+                    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+                    // Bind the attribute/buffer set we want.
+                    gl.bindVertexArray(vao);
+
+                    //gl.drawElements(primitiveType, vertexCount, type, offset);
+                    gl.drawElements(gl.TRIANGLES, nVertexElements, gl.UNSIGNED_SHORT, 0);
+                }
+            }
+			
+            function draw() {
+				let useSpecular = 1.0;
+				let useTranslucent = 1.0;
+				if(guiHandle.specularOption === 'noSpecular') {
+					useSpecular = 0.0;
+				}
+				if(guiHandle.translucentOption === 'noTranslucent') {
+					useTranslucent = 0.0;
+				}
+				//Get depth frame for shadows / transluscent light
+				gl.bindFramebuffer(gl.FRAMEBUFFER, depthFB);
+				renderScene.drawDepth(lightViewMatrix, lightProjectionMatrix);
+				
+                //Draw unwrapped texture
+                gl.bindFramebuffer(gl.FRAMEBUFFER, blurFB);
+                renderScene.drawUnwrap(lightViewMatrix, lightProjectionMatrix, texture, depthFrameTex, useTranslucent);
+                //User can decide whether or not to blur
+                if (guiHandle.blurOption === 'blur') {
+                    for (var i = 0; i < 8; i++) {
+                        gl.bindFramebuffer(gl.FRAMEBUFFER, tempFB);
+                        renderQuad.draw(blurFrameTex, 0.0);
+
+                        gl.bindFramebuffer(gl.FRAMEBUFFER, blurFB);
+                        renderQuad.draw(tempFrameTex, 1.0);
+                    }
+					
+                    //Unbind framebuffer to render to screen
+                    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                    //Renders face with blurred texture
+                    renderScene.draw(viewMatrix, projectionMatrix, lightViewMatrix, lightProjectionMatrix, blurFrameTex, depthFrameTex, specularTexture, useSpecular);
+					//simpleQuad.draw(blurFrameTex);
+                }
+                else {
+                    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                    renderScene.draw(viewMatrix, projectionMatrix, lightViewMatrix, lightProjectionMatrix, blurFrameTex, depthFrameTex, specularTexture, useSpecular);
+                }
+				
+            }
+		}
+    </script>
+</head>
+<body onload="main()">
+    <!-- Canvas Drawing size: specified as tag width and height, Display size: specified by CSS style.-->
+    <canvas id="c" style="width: 75vw; height: 75vh; margin-left: 12vw; margin-top:12vh; border:1px solid #000000;"></canvas>
+</body>
+</html>
